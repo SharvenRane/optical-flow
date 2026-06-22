@@ -1,91 +1,101 @@
-# Optical Flow
+# Optical Flow from Scratch
 
-Optical flow estimation: RAFT, FlowFormer, UniMatch compared on Sintel and KITTI
+Two classical dense optical flow estimators implemented with nothing but NumPy
+and SciPy: Lucas Kanade and Horn Schunck. Given two consecutive frames the code
+estimates how every pixel moved from the first frame to the second.
 
-`optical-flow` `video` `motion-estimation` `benchmark` `pytorch`
+Both methods start from the same idea, brightness constancy. A small patch of
+the image keeps its intensity as it moves, so the change in brightness over time
+is explained entirely by motion across the spatial gradient. Linearising that
+statement gives the optical flow constraint
 
-## Overview
+    Ix * u + Iy * v + It = 0
 
-This repository implements a complete pipeline for **optical flow**, covering
-data preprocessing, model training, evaluation, and deployment.
+where `Ix` and `Iy` are the spatial gradients of the image, `It` is the
+difference between the two frames, and `(u, v)` is the flow we want. One
+equation per pixel is not enough to solve for two unknowns, so each method adds
+a different assumption to close the gap.
 
-## Features
+## The two methods
 
-- Clean, modular PyTorch implementation
-- Reproducible experiments with MLflow tracking
-- Comprehensive evaluation with standard benchmarks
-- ONNX export for production deployment
-- Detailed documentation and usage examples
+**Lucas Kanade** assumes the flow is constant inside a small window around each
+pixel. That turns the single under determined equation into an over determined
+2x2 least squares system, which is solved in closed form at every pixel using
+the local structure tensor. It is fast and works well where the image has
+texture in both directions. In flat regions the system is poorly conditioned, so
+a small ridge term is added to the diagonal to keep it stable.
 
-## Installation
+**Horn Schunck** treats flow estimation as a global energy minimisation. It
+trades the brightness constancy residual against a smoothness penalty that
+discourages the flow from changing abruptly between neighbours. The minimiser is
+found by iterating a simple update that nudges each pixel toward the local
+average flow and then corrects it along the image gradient. The `alpha` weight
+sets how much smoothness wins over data fidelity.
 
-```bash
-git clone https://github.com/YOUR_USERNAME/optical-flow.git
-cd optical-flow
-pip install -r requirements.txt
+## Flow convention
+
+`u` is the horizontal displacement along columns (the x axis) and `v` is the
+vertical displacement along rows (the y axis). Positive `u` means content moved
+right between the frames, positive `v` means it moved down. The synthetic data
+generator uses the same `(dx, dy)` convention, so the ground truth shift lines up
+directly with the estimated `(u, v)`.
+
+## Layout
+
 ```
-
-## Quick Start
-
-```python
-from src.model import Model
-from src.trainer import Trainer
-from src.config import Config
-
-config = Config.from_yaml("configs/default.yaml")
-model = Model(config)
-trainer = Trainer(model, config)
-trainer.train()
+src/flow.py      gradients, lucas_kanade, horn_schunck, make_shifted_pair
+tests/           pytest behaviour checks
 ```
-
-## Project Structure
-
-```
-optical-flow/
-├── src/
-│   ├── model.py        # Model architecture
-│   ├── dataset.py      # Data loading and preprocessing
-│   ├── trainer.py      # Training loop
-│   ├── evaluate.py     # Evaluation metrics
-│   └── utils.py        # Helper utilities
-├── configs/
-│   └── default.yaml    # Default configuration
-├── notebooks/
-│   └── exploration.ipynb
-├── tests/
-│   └── test_model.py
-├── requirements.txt
-└── README.md
-```
-
-## Results
-
-| Model | Dataset | Metric | Score |
-|-------|---------|--------|-------|
-| Baseline | Standard | Primary | - |
-| Ours | Standard | Primary | - |
 
 ## Usage
 
-```bash
-# Train
-python train.py --config configs/default.yaml
+```python
+import numpy as np
+from src.flow import make_shifted_pair, lucas_kanade, horn_schunck
 
-# Evaluate
-python evaluate.py --checkpoint checkpoints/best.pth
+# Build a frame pair related by a known shift of one pixel to the right.
+frame1, frame2 = make_shifted_pair(shape=(80, 80), shift=(1.0, 0.0), seed=0)
 
-# Export to ONNX
-python export.py --checkpoint checkpoints/best.pth
+u, v = lucas_kanade(frame1, frame2, window_size=21, sigma=1.0)
+print("Lucas Kanade median flow:", np.median(u), np.median(v))
+
+u, v = horn_schunck(frame1, frame2, alpha=1.0, num_iterations=400, sigma=1.0)
+print("Horn Schunck median flow:", np.median(u), np.median(v))
 ```
 
-## References
+`make_shifted_pair` generates a random smoothed texture and translates it by a
+known amount, so the shift you pass in is the ground truth that the estimators
+should recover. Smoothing matters here. The flow constraint is a linear
+approximation, and it only tracks motion that is small relative to the spatial
+scale of the texture, so a sharp random image would break it while a smoothed one
+behaves well.
 
-- Relevant papers and resources for optical flow
+## Tests
 
-## License
+The test suite checks the behaviour that should hold for any correct
+implementation rather than fixed magic numbers:
 
-MIT
+- Gradients vanish for a constant image and match a known ramp.
+- Both estimators report near zero flow when the two frames are identical.
+- Both estimators recover a known translation on the image interior within a
+  tolerance, across several shift directions including sub pixel and diagonal
+  shifts.
+- The sign of the recovered flow matches the direction of motion.
+- The two independent estimators agree with each other on the same input.
+- Output shapes match the input and mismatched frame shapes raise an error.
 
-# update 3
+Run them with:
 
-# update 13
+```
+python -m pytest tests/ -q
+```
+
+All 15 tests pass on CPU in well under a second with no downloads.
+
+## Notes
+
+The implementations are deliberately single scale. Both methods rely on the
+linearised brightness constancy constraint, which is only valid for motion that
+is small compared to the texture scale. Larger displacements would need a
+coarse to fine pyramid, which is a natural extension but is outside the scope
+here.
